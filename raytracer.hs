@@ -288,7 +288,7 @@ updatePixel :: Index -> VecF -> IO ()
 updatePixel p@(x, y) c@(r, g, b) = do
                         G.renderPrimitive G.Points $ do
                             G.color $ G.Color3 (CFloat r) (CFloat g) (CFloat b)
-                            G.vertex $ Vertex3 (CFloat (Prelude.fromIntegral x)) (CFloat (Prelude.fromIntegral y)) 0
+                            G.vertex $ Vertex3 (CFloat (Prelude.fromIntegral x)) (CFloat (Prelude.fromIntegral (height - y))) 0
 
 
 constructRay :: Scene -> Exp VecF -> Exp Index -> Exp Ray
