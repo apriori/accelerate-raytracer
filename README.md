@@ -1,6 +1,8 @@
 accelerate-raytracer
 ====================
 
+![ScreenShot](https://raw.github.com/apriori/accelerate-raytracer/master/results.png)
+
 A simple raytracer written in haskell accelerate EDSL
 based upon https://gist.github.com/AdrianV/5774141, which is based upon http://forum.dlang.org/thread/yzsqwejxqlnzryhrkfuq@forum.dlang.org#post-yzsqwejxqlnzryhrkfuq:40forum.dlang.org
 
