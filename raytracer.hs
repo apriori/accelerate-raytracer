@@ -1,22 +1,28 @@
-{-# LANGUAGE FlexibleContexts      #-}
-{-# LANGUAGE BangPatterns          #-}
+{-# LANGUAGE BangPatterns #-}
 
 import Graphics.Rendering.OpenGL.GL.Tensor
 import Data.Array.Accelerate as A
-import qualified Data.Array.Repa as R
 import qualified Data.Array.Accelerate.CUDA as I
 import Data.List hiding (intersect)
 import Foreign.C.Types
 import Foreign.Ptr
 import Data.Int
+import Prelude as P
 
 import Data.Word
 import qualified Graphics.UI.GLUT as G
 import Graphics.Rendering.OpenGL.GL.CoordTrans
 
+width :: Int
 width = 640
+
+height :: Int
 height = 480
+
+fov :: Float
 fov = 45.0
+
+maxdepth :: Int
 maxdepth = 2
 
 type VectorF = Vertex3 Float
@@ -25,6 +31,10 @@ type Vec a = (a, a, a)
 type VecF = Vec Float
 type SphereIntersect = (Bool, Sphere, Float)
 type Index = (Int, Int)
+type ArrayPlane a = Array DIM2 a
+
+nullVector :: Exp (VecF)
+nullVector = constant (0.0, 0.0, 0.0) 
 
 infixl 6 -.
 infixl 6 +.
@@ -85,6 +95,9 @@ start r = A.fst r
 dir :: Exp Ray -> Exp VecF
 dir r = A.snd r
 
+nullRay :: Exp Ray
+nullRay = lift (nullVector, nullVector)
+
 type Sphere = (VecF, --center
                Float,        --radius
                VecF, --scolor
@@ -122,6 +135,16 @@ color :: Exp Light -> Exp VecF
 color l = A.snd l
 
 type Scene = (Vector Sphere, Vector Light)
+type MultiBounceFactor = (Float, -- reflection
+                          Float) -- refraction
+
+nullMultiBounceFactor :: Exp MultiBounceFactor
+nullMultiBounceFactor = constant $ (0.0, 0.0)
+
+type MultiRay = (Ray, Ray, MultiBounceFactor)
+
+nullMultiRay :: Exp MultiRay
+nullMultiRay = lift (nullRay, nullRay, nullMultiBounceFactor) :: Exp MultiRay
 
 objects :: Scene -> Vector Sphere
 objects (spheres, lights) = spheres
@@ -196,38 +219,145 @@ colorforlight s sph pip norm l =
                              let 
                                 lightpos = position l
                                 lightdirection = normalized (lightpos -. pip)
-                                --r = lift $ (pip, lightdirection)
-                                --blocked = (I.run $ isblocked (objects s) r) `indexArray` Z
                                 blocked = False 
-                                clr = ((color l) **. (A.max 0.0 (dot norm lightdirection))) 
+                                clr = ((color l) **. (P.max 0.0 (dot norm lightdirection))) 
                                         *. (scolor sph)  **. (1.0 - reflection sph)
                              in
                                 if blocked then constant (0.0, 0.0, 0.0) else clr
 
-traceAll :: Array DIM2 Ray -> Scene -> Acc (Array DIM2 VecF)
-traceAll rays scene = let
-                            minintersects = minInterSects scene (use rays)
-                            intersectsWithRays = A.zip minintersects (use rays)
-                            usedLights = use $ lights scene
-                            l = size usedLights
-                            cols = A.replicate (lift $ Z :. All   :. All    :. l  ) intersectsWithRays
-                            rows = A.replicate (lift $ Z :. width :. height :. All) usedLights
-                      in
-                            A.fold (+.) (constant (0.0, 0.0, 0.0)) $ 
-                                A.zipWith (trace scene 0) cols rows
-                            
-traceBla :: Scene -> Int -> Exp (SphereIntersect, Ray) -> Exp Light -> Exp VecF
-traceBla s d r l = let (p, c) = unlift l :: (Exp VecF, Exp VecF) in
-                   lift $ c
-                       
+traceStep :: Scene -> Acc (ArrayPlane Int) -> Acc (ArrayPlane Ray) -> Acc (ArrayPlane MultiBounceFactor) -> Acc (ArrayPlane (MultiRay, Int, VecF))
+traceStep scene depths rays factors = let
+                                    minintersects = minInterSects scene rays
+                                    intersectsWithRays = A.zip minintersects rays
+                                    usedLights = use $ lights scene
+                                    l = size usedLights
+                                    bounceCols = A.replicate (lift $ Z :. All   :. All    :. l) factors
+                                    depthCols  = A.replicate (lift $ Z :. All   :. All    :. l) depths
+                                    cols       = A.replicate (lift $ Z :. All   :. All    :. l) intersectsWithRays
+                                    rows       = A.replicate (lift $ Z :. width :. height :. All) usedLights
+                                in
+                                    A.fold1 (\a b -> 
+                                                let
+                                                    (multiray1, depth1, color1) = unlift a :: (Exp MultiRay, Exp Int, Exp VecF)
+                                                    (multiray2, depth2, color2) = unlift a :: (Exp MultiRay, Exp Int, Exp VecF)
 
-trace :: Scene -> Int -> Exp (SphereIntersect, Ray) -> Exp Light -> Exp VecF
-trace s d r l = let 
-                (intersectingSphere, ray) = unlift r :: (Exp SphereIntersect, Exp Ray)
+                                                in
+                                                    lift (multiray2, depth1 + depth2, color1 +. color2)
+                                            )
+                                            $
+                                            A.zipWith4 (trace scene) depthCols cols rows bounceCols
+infixl 6 $+.
+($+.) :: Acc (ArrayPlane VecF) -> Acc (ArrayPlane VecF) -> Acc (ArrayPlane VecF)
+($+.) a b = A.zipWith (+.) a b
+
+
+infixl 6 $-.
+($-.) :: Acc (ArrayPlane VecF) -> Acc (ArrayPlane VecF) -> Acc (ArrayPlane VecF)
+($-.) a b = A.zipWith (-.) a b
+
+infixl 7 $*.
+($*.) :: Acc (ArrayPlane VecF) -> Acc (ArrayPlane Float) -> Acc (ArrayPlane VecF)
+($*.) a b = A.zipWith (**.) a b
+
+traceAll :: Acc (ArrayPlane Ray) -> Scene -> Acc (ArrayPlane VecF)
+traceAll rays scene = let
+                            color0 = generate (index2 (lift width) (lift height)) (\a -> (nullVector))
+                            d0 = generate (index2 (lift width) (lift height)) (\a -> (constant 0))
+                            factor0 = generate (index2 (lift width) (lift height)) (\a -> (constant (0.0, 0.0)))
+                            ray0 = generate (index2 (lift width) (lift height)) (\a -> nullRay)
+                            multiray0 = A.zip3 rays ray0 factor0
+
+                            traceMapStep :: Acc (ArrayPlane VecF) -> 
+                                            Acc (ArrayPlane MultiRay) -> 
+                                            (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))])
+                            traceMapStep nc r = let
+                                                        (reflectionRays, refractionRays, bounceFactors) = A.unzip3 r
+                                                        (reflectionFactors, refractionFactors) = A.unzip bounceFactors
+
+                                                        reflectionContribution = traceStep scene d0 reflectionRays bounceFactors 
+                                                        (reflMultiRays, reflDepths, reflImage) = A.unzip3 reflectionContribution
+                                                        (reflReflRays, reflRefrRays, reflBounceFactors) = A.unzip3 reflMultiRays
+
+                                                        refractionContribution = traceStep scene d0 refractionRays bounceFactors
+                                                        (refrMultiRays, refrDepths, refrImage) = A.unzip3 refractionContribution
+                                                        (refrReflRays, refrRefrRays, refrBounceFactors) = A.unzip3 refrMultiRays
+                                                        
+                                                        --newAccImage = nc $+. reflImage $+. refrImage
+                                                        newAccImage = nc -- $+. reflImage
+                                                        newAccImageRefl = --newAccImage $+. 
+                                                                          (reflImage $*. reflectionFactors)
+                                                        newTotalAccImage = newAccImageRefl $+. 
+                                                                           (refrImage $*. refractionFactors)
+                                                        reflNewMultiRays = A.zip3 reflReflRays reflRefrRays reflBounceFactors
+                                                        --refrNewMultiRays = A.zip3 refrReflRays refrRefrRays refrBounceFactors
+                                                        newList = [(reflImage, reflNewMultiRays)] 
+                                                        --P.++ [(refrImage, refrNewMultiRays)]
+                                                   in
+                                                        (newTotalAccImage, newList)
+
+                            traceIter :: (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))]) -> 
+                                         (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))])
+                            traceIter (c0, accList) = let
+                                                            (subImages, multiRays) = P.unzip accList
+                                                            (newSubImages, raysAndImages) = P.unzip $ 
+                                                                                            P.zipWith traceMapStep subImages multiRays
+                                                            accImage = P.foldl ($+.) c0 subImages
+                                                            totalAccImage = P.foldl ($+.) accImage newSubImages
+                                                            newRayList = P.concat raysAndImages
+                                                      in
+                                                            (totalAccImage, newRayList)
+                            --trace0 = traceMapStep color0 multiray0
+                            trace0 = (color0, [(color0, multiray0)])
+                            (accImage, _) = foldr ($) trace0 (Data.List.take maxdepth (repeat traceIter))
+                            --(accImage, _) = traceIter trace0
+                      in
+                            accImage
+
+-- Ray -> Sphere -> Normal -> dotNormal -> PointOfHit -> FresnelEffect -> (FresnelEffect, Ray)
+reflectionFactorAndRay :: Exp Ray -> Exp Sphere -> Exp VecF -> Exp Float -> Exp VecF -> Exp Float -> Exp (Float, Ray)
+reflectionFactorAndRay r s n dn pip f = lift (f, lift (pip, reflectiondirection) :: Exp Ray)
+                                where
+                                    reflectionRatio = reflection (lift s)
+                                    facing = P.max 0.0 (-dn)
+                                    reflectiondirection = (dir r) -. (n **. (2.0 * dn))
+
+-- Ray -> Sphere -> Normal -> PointOfImpact -> Inside -> Fresnel -> Depth -> (RefractionEffect, Ray)
+refractionFactorAndRay :: Exp Ray -> Exp Sphere -> Exp VecF -> Exp VecF -> Exp Bool -> Exp Float -> Exp Int -> Exp (Float, Ray)
+refractionFactorAndRay r s n pip ins f d = let 
+                                        nullRay = ((constant (0.0, 0.0, 0.0)), (constant (0.0, 0.0, 0.0)))
+                                        nullElement = lift (constant 0, nullRay)
+                                     in
+                                        (transparency s >* 0.0) ?
+                                                (
+                                                                let 
+                                                                    ce = (dot (dir r) n) * (-1.0)
+                                                                    iorconst = constant 1.5 
+                                                                    ior = ins ? (1.0 / iorconst, iorconst) :: Exp Float
+                                                                    eta = 1.0 / ior
+                                                                    gf = (dir r) +. (n **. (ce * eta))
+                                                                    sin_t1_2 = 1.0 - ce * ce
+                                                                    sin_t2_2 = sin_t1_2 * (eta * eta)
+                                                                in
+                                                                    (sin_t2_2 <* 1.0) ? (
+                                                                        let 
+                                                                            gc = n **. (sqrt 1 - sin_t2_2)
+                                                                            refraction_direction = gf -. gc 
+                                                                            refraction =  (1.0 - f) * (transparency s)
+                                                                        in
+                                                                        lift (refraction, (pip, refraction_direction)),
+                                                                        nullElement
+                                                                    ),
+                                                nullElement)
+
+trace :: Scene -> Exp Int -> Exp (SphereIntersect, Ray) -> Exp Light -> Exp (Float, Float)-> Exp (MultiRay, Int, VecF)
+trace s d i l f = let 
+                (reflectionFactor, refractionFactor) = unlift f :: (Exp Float, Exp Float)
+                (intersectingSphere, ray) = unlift i :: (Exp SphereIntersect, Exp Ray)
                 (hasIntersect, sp, di) = unlift intersectingSphere :: (Exp Bool, Exp Sphere, Exp Float)
                 (rstart, rdir) = unlift ray :: (Exp VecF, Exp VecF)
               in
-                ((hasIntersect) ? (
+                --((ray /=* nullRay) &&* hasIntersect) ? (
+                (hasIntersect) ? (
                                 let 
                                     pointofhit = (dir ray) **. (lift di) +. start ray
                                     normal_unrefl = normalizeSphereSurface (lift sp) pointofhit
@@ -235,69 +365,66 @@ trace s d r l = let
                                     isinside = (dotnormalray_unrefl >* 0) ? (ctrue, cfalse)
                                     dotnormalray = (dotnormalray_unrefl >* 0) ? (-dotnormalray_unrefl, dotnormalray_unrefl)
                                     normal = (dotnormalray_unrefl >* 0) ? (normal_unrefl **. (-1.0), normal_unrefl)
-                                    reflectionratio = reflection (lift sp)
-                                    transparencyratio = transparency (lift sp)
-                                    facing = A.max 0.0 (-dotnormalray)
-                                    fresneleffect = reflectionratio + (1.0 - reflectionratio) * ((1.0 -facing) ^^ 5)
-                                    clr = colorforlight s (lift sp) pointofhit (normal **. 1.0) l
-                                    --clr = lift $ (fresneleffect, fresneleffect, fresneleffect)
-                                in 
 
-                                --reflection
-                                --if (d < maxdepth) then 
-                                --    let reflexclr =  if (reflectionratio > 0) then
-                                --                        let reflectiondirection = (dir r) -. (normal *. 2.0 *. dotnormalray) in
-                                --                        (trace (Ray pointofhit reflectiondirection) s (d + 1)) *. fresneleffect
-                                --                     else
-                                --                        fromListStatic [0.0, 0.0, 0.0]
-                                --                     in
-                                    --let refractclr = if transparencyratio > 0.0 then
-                                    --                    let ce = (dot (dir r) normal) * (-1.0) in
-                                    --                    let iorconst = 1.5 in
-                                    --                    let ior = if isinside then 1.0 / iorconst else iorconst in
-                                    --                    let eta = 1.0 / ior in
-                                    --                    let gf = (dir r) +. (normal *.ce) *. eta in
-                                    --                    let sin_t1_2 = 1.0 - ce * ce in 
-                                    --                    let sin_t2_2 = sin_t1_2 * (eta * eta) in
-                                    --                    if sin_t2_2 < 1.0 then
-                                    --                      let gc = normal *. (sqrt 1 - sin_t2_2) in
-                                    --                      let refraction_direction = gf -. gc in
-                                    --                      let refraction = trace (Ray pointofhit refraction_direction) s (d + 1) in
-                                    --                      refraction *. (1.0 - fresneleffect) *. (transparency sp)
-                                    --                    else 
-                                    --                      fromListStatic [0.0, 0.0, 0.0]
-                                    --                  else
-                                    --                    fromListStatic [0.0, 0.0, 0.0]
-                                    --                  in
-                                 --   let scaleMax = (fromIntegral (maxdepth - d - 1)) in
-                                 --   let scaleMin = fromIntegral (maxdepth - 1) in
-                                 --   let scale = scaleMax / scaleMin in
-                                    --clr +. (reflexclr *. scale)
-                                --    clr +. reflexclr
-                                --else
-                                --    fromListStatic [0.0, 0.0, 0.0]
-                                --    clr
-                                
-                                    --lift (fresneleffect, fresneleffect, fresneleffect),
-                                    --lift clr
-                                    clr,
-                                    constant (0.0, 0.0, 0.0)))
+                                    transparencyratio = transparency (lift sp)
+                                    facing = P.max 0.0 (-dotnormalray)
+                                    fresneleffect = reflectionFactor + (1.0 - reflectionFactor) * ((1.0 -facing) ^^ 5)
+                                    clr = colorforlight s (lift sp) pointofhit (normal **. 1.0) l
+                                    nullFloatRay = lift ((constant 0.0), nullRay) :: Exp (Float, Ray)
+
+                                    (newReflectionFactor, reflectionRay) = unlift (
+                                            (d <* constant maxdepth) ? (
+                                                    --reflection
+                                                    (reflectionFactor ==* 0.0) ? (  
+                                                         nullFloatRay,
+                                                         --calculate next ray direction and color factor for next trace 
+                                                         reflectionFactorAndRay ray 
+                                                                                sp 
+                                                                                normal 
+                                                                                dotnormalray 
+                                                                                pointofhit
+                                                                                fresneleffect),
+                                                    nullFloatRay)) :: (Exp Float, Exp Ray)
+
+                                    (newRefractionFactor, refractionRay) = unlift (
+                                            (d <* constant maxdepth) ? (
+                                                    --reflection
+                                                    (refractionFactor ==* 0.0) ? (  
+                                                             nullFloatRay,
+                                                             --calculate next ray direction and color factor for next trace 
+                                                             refractionFactorAndRay ray 
+                                                                                    sp 
+                                                                                    normal 
+                                                                                    pointofhit
+                                                                                    isinside 
+                                                                                    fresneleffect 
+                                                                                    d), 
+                                                    nullFloatRay)) :: (Exp Float, Exp Ray)
+                                in  
+                                    lift (
+                                          lift (
+                                                reflectionRay, refractionRay, 
+                                                lift (newReflectionFactor, newRefractionFactor) :: Exp MultiBounceFactor
+                                               ) :: Exp MultiRay, 
+                                            d + 1, clr),
+                                    lift (nullMultiRay, d, nullVector)
+                                )
 
 
 updatePixel :: Index -> VecF -> IO ()
 updatePixel p@(x, y) c@(r, g, b) = do
                         G.renderPrimitive G.Points $ do
                             G.color $ G.Color3 (CFloat r) (CFloat g) (CFloat b)
-                            G.vertex $ Vertex3 (CFloat (Prelude.fromIntegral x)) (CFloat (Prelude.fromIntegral (height - y))) 0
+                            G.vertex $ Vertex3 (CFloat (P.fromIntegral x)) (CFloat (P.fromIntegral (height - y))) 0
 
 
 constructRay :: Scene -> Exp VecF -> Exp Index -> Exp Ray
 constructRay s eye idx =  let 
                             (x, y) = unlift idx :: (Exp Int, Exp Int)
-                            h = constant $ (tan (fov / 360.0 * 2.0 * pi / 2.0)) * 2.0
+                            h = constant $ (tan (fov / 360.0 * 2.0 * pi / 2.0)) * 2.0 
                             
-                            ww = A.fromIntegral $ constant width
-                            hh = A.fromIntegral $ constant height
+                            ww = A.fromIntegral $ constant width :: Exp Float
+                            hh = A.fromIntegral $ constant height :: Exp Float
                             w = h * ww / hh
                             rx = ((A.fromIntegral x) - ww/2.0) /ww * w
                             ry = (hh / 2.0 - (A.fromIntegral y)) / hh * h
@@ -309,7 +436,7 @@ constructRay s eye idx =  let
 
 calcPixels :: Scene -> Exp VecF -> Acc (Array DIM2 Index) -> Acc (Array DIM2 VecF)
 calcPixels s eye idx =  let 
-                            rays = I.run $ A.map (constructRay s eye) idx
+                            rays = A.map (constructRay s eye) idx
                         in
                             traceAll rays s  
 
@@ -327,18 +454,58 @@ render :: Scene -> IO ()
 render s = do
                 let 
                     eye = constant (0.0, 0.0, 0.0)
-                    indices = A.fromList (Z :. width :. height) [ (x, y) | x <- [0..width-1], y <- [0..height-1]] :: A.Array A.DIM2 Index
-                    pixels = calcPixels s eye (use indices)
-                    pixelsWithIndices = I.run $ A.zip (use indices) pixels
+                    indices = A.generate (lift $ Z :. width :. height) unindex2 
+                    pixels = calcPixels s eye indices
+                    pixelsWithIndices = I.run $ A.zip indices pixels
                 putStrLn "calculation done"
                 updateAllPixels pixelsWithIndices 0 0
+mainDbg :: IO ()
+mainDbg = do    
+          let scene = (        (fromList (Z :. 5) [
+                               ((0.0, -10002.0, -20.0),
+                                         10000.0,
+                                         (0.8, 0.8, 0.8),
+                                         0.0,
+                                         0.0),
+                               ((0.0, 2.0, -20.0),
+                                         4.0,
+                                         (0.8, 0.5, 0.5),
+                                         0.5,
+                                         0.0),
+                               ((5.0, 0.0, -15.0),
+                                         2.0,
+                                         (0.3, 0.8, 0.8),
+                                         0.2,
+                                         0.0),
+                               ((-5.0, 0.0, -15.0),
+                                         2.0,
+                                         (0.3, 0.5, 0.8),
+                                         0.2,
+                                         0.0),
+                               ((-2.0, -1.0, -10.0),
+                                         1.0,
+                                         (0.1, 0.1, 0.1),
+                                         0.1,
+                                         0.8)
+                               ]),
+                              (fromList (Z :. 1) [
+                                ((-10.0, 20.0, 30.0),
+                                     (2.0, 2.0, 2.0))
+                               ]) 
+                        )
+              eye = constant (0.0, 0.0, 0.0)
+              indices = A.generate (lift $ Z :. width :. height) unindex2 
+              pixels = calcPixels scene eye indices
+              !pixelsWithIndices = I.run $ A.zip indices pixels
+          putStrLn "calculation done"
 
-main :: IO ()
-main = do    
+
+mainNormal :: IO ()
+mainNormal = do    
           (progname, _) <- G.getArgsAndInitialize
           w <- G.createWindow "Haskell raytracer"
-          G.windowSize G.$= (G.Size (CInt (Prelude.fromIntegral width)) (CInt (Prelude.fromIntegral height)))
-          let scene = (        (fromList (Z :. 4) [
+          G.windowSize G.$= (G.Size (CInt (P.fromIntegral width)) (CInt (P.fromIntegral height)))
+          let scene = (        (fromList (Z :. 5) [
                                ((0.0, -10002.0, -20.0),
                                          10000.0,
                                          (0.8, 0.8, 0.8),
@@ -374,12 +541,15 @@ main = do
           G.displayCallback G.$= display scene
           G.mainLoop
 
+main :: IO ()
+main = mainDbg
+
 reshape :: Size -> IO ()
 reshape size@(Size w h) = do
                G.viewport G.$= (Position 0 0, size)
                G.matrixMode G.$= Projection
                G.loadIdentity
-               ortho 0.0 (Prelude.fromIntegral w) 0.0 (Prelude.fromIntegral h) (-1.0) 1.0
+               ortho 0.0 (P.fromIntegral w) 0.0 (P.fromIntegral h) (-1.0) 1.0
                G.matrixMode G.$= Modelview 0
 
 display :: Scene  -> IO ()
