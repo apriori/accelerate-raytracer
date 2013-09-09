@@ -23,7 +23,7 @@ fov :: Float
 fov = 45.0
 
 maxdepth :: Int
-maxdepth = 2
+maxdepth = 6
 
 type VectorF = Vertex3 Float
 type VectorI = Vertex3 Int
@@ -219,11 +219,11 @@ colorforlight s sph pip norm l =
                              let 
                                 lightpos = position l
                                 lightdirection = normalized (lightpos -. pip)
-                                blocked = False 
+                                blocked = Main.intersect sph $ lift (pip, lightdirection)
                                 clr = ((color l) **. (P.max 0.0 (dot norm lightdirection))) 
                                         *. (scolor sph)  **. (1.0 - reflection sph)
                              in
-                                if blocked then constant (0.0, 0.0, 0.0) else clr
+                                (blocked) ? (constant (0.0, 0.0, 0.0), clr)
 
 traceStep :: Scene -> Acc (ArrayPlane Int) -> Acc (ArrayPlane Ray) -> Acc (ArrayPlane MultiBounceFactor) -> Acc (ArrayPlane (MultiRay, Int, VecF))
 traceStep scene depths rays factors = let
@@ -236,11 +236,12 @@ traceStep scene depths rays factors = let
                                     cols       = A.replicate (lift $ Z :. All   :. All    :. l) intersectsWithRays
                                     rows       = A.replicate (lift $ Z :. width :. height :. All) usedLights
                                 in
-                                    A.fold1 (\a b -> 
+                                    A.fold1 
+                                            (
+                                                \a b -> 
                                                 let
                                                     (multiray1, depth1, color1) = unlift a :: (Exp MultiRay, Exp Int, Exp VecF)
-                                                    (multiray2, depth2, color2) = unlift a :: (Exp MultiRay, Exp Int, Exp VecF)
-
+                                                    (multiray2, depth2, color2) = unlift b :: (Exp MultiRay, Exp Int, Exp VecF)
                                                 in
                                                     lift (multiray2, depth1 + depth2, color1 +. color2)
                                             )
@@ -261,55 +262,41 @@ infixl 7 $*.
 
 traceAll :: Acc (ArrayPlane Ray) -> Scene -> Acc (ArrayPlane VecF)
 traceAll rays scene = let
-                            color0 = generate (index2 (lift width) (lift height)) (\a -> (nullVector))
                             d0 = generate (index2 (lift width) (lift height)) (\a -> (constant 0))
-                            factor0 = generate (index2 (lift width) (lift height)) (\a -> (constant (0.0, 0.0)))
+                            factor0 = generate (index2 (lift width) (lift height)) (\a -> (constant (1.0, 0.0)))
                             ray0 = generate (index2 (lift width) (lift height)) (\a -> nullRay)
                             multiray0 = A.zip3 rays ray0 factor0
 
-                            traceMapStep :: Acc (ArrayPlane VecF) -> 
-                                            Acc (ArrayPlane MultiRay) -> 
-                                            (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))])
-                            traceMapStep nc r = let
+                            traceMapStep :: Acc (ArrayPlane MultiRay) -> 
+                                            (Acc (ArrayPlane VecF), [Acc (ArrayPlane MultiRay)])
+                            traceMapStep r = let
                                                         (reflectionRays, refractionRays, bounceFactors) = A.unzip3 r
                                                         (reflectionFactors, refractionFactors) = A.unzip bounceFactors
 
                                                         reflectionContribution = traceStep scene d0 reflectionRays bounceFactors 
                                                         (reflMultiRays, reflDepths, reflImage) = A.unzip3 reflectionContribution
-                                                        (reflReflRays, reflRefrRays, reflBounceFactors) = A.unzip3 reflMultiRays
 
                                                         refractionContribution = traceStep scene d0 refractionRays bounceFactors
                                                         (refrMultiRays, refrDepths, refrImage) = A.unzip3 refractionContribution
                                                         (refrReflRays, refrRefrRays, refrBounceFactors) = A.unzip3 refrMultiRays
                                                         
-                                                        --newAccImage = nc $+. reflImage $+. refrImage
-                                                        newAccImage = nc -- $+. reflImage
-                                                        newAccImageRefl = --newAccImage $+. 
-                                                                          (reflImage $*. reflectionFactors)
-                                                        newTotalAccImage = newAccImageRefl $+. 
-                                                                           (refrImage $*. refractionFactors)
-                                                        reflNewMultiRays = A.zip3 reflReflRays reflRefrRays reflBounceFactors
-                                                        --refrNewMultiRays = A.zip3 refrReflRays refrRefrRays refrBounceFactors
-                                                        newList = [(reflImage, reflNewMultiRays)] 
-                                                        --P.++ [(refrImage, refrNewMultiRays)]
+                                                        reflDeltaImage = reflImage $+. refrImage
+                                                        newList = [reflMultiRays] 
+                                                        --P.++ [refrMultiRays]
                                                    in
-                                                        (newTotalAccImage, newList)
+                                                        (reflDeltaImage, newList)
 
-                            traceIter :: (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))]) -> 
-                                         (Acc (ArrayPlane VecF), [(Acc (ArrayPlane VecF), Acc (ArrayPlane MultiRay))])
-                            traceIter (c0, accList) = let
-                                                            (subImages, multiRays) = P.unzip accList
-                                                            (newSubImages, raysAndImages) = P.unzip $ 
-                                                                                            P.zipWith traceMapStep subImages multiRays
-                                                            accImage = P.foldl ($+.) c0 subImages
-                                                            totalAccImage = P.foldl ($+.) accImage newSubImages
-                                                            newRayList = P.concat raysAndImages
+                            traceIter :: (Acc (ArrayPlane VecF), [Acc (ArrayPlane MultiRay)]) -> 
+                                         (Acc (ArrayPlane VecF), [Acc (ArrayPlane MultiRay)])
+                            traceIter (c0, rayList) = let
+                                                            (newDeltaImages, newRays) = P.unzip $ 
+                                                                                            P.map traceMapStep rayList
+                                                            accImage = P.foldl ($+.) c0 newDeltaImages
+                                                            newRayList = P.concat newRays
                                                       in
-                                                            (totalAccImage, newRayList)
-                            --trace0 = traceMapStep color0 multiray0
-                            trace0 = (color0, [(color0, multiray0)])
+                                                            (accImage, newRayList)
+                            trace0 = traceMapStep multiray0
                             (accImage, _) = foldr ($) trace0 (Data.List.take maxdepth (repeat traceIter))
-                            --(accImage, _) = traceIter trace0
                       in
                             accImage
 
@@ -365,17 +352,18 @@ trace s d i l f = let
                                     isinside = (dotnormalray_unrefl >* 0) ? (ctrue, cfalse)
                                     dotnormalray = (dotnormalray_unrefl >* 0) ? (-dotnormalray_unrefl, dotnormalray_unrefl)
                                     normal = (dotnormalray_unrefl >* 0) ? (normal_unrefl **. (-1.0), normal_unrefl)
-
+                                    refl = reflection (lift sp)
                                     transparencyratio = transparency (lift sp)
                                     facing = P.max 0.0 (-dotnormalray)
-                                    fresneleffect = reflectionFactor + (1.0 - reflectionFactor) * ((1.0 -facing) ^^ 5)
-                                    clr = colorforlight s (lift sp) pointofhit (normal **. 1.0) l
+                                    fresneleffect = refl + (1.0 - refl) * ((1.0 -facing) ^^ 5)
+                                    traceclr = colorforlight s (lift sp) pointofhit (normal **. 1.0) l
+                                    clr = traceclr **. (reflectionFactor + refractionFactor)
                                     nullFloatRay = lift ((constant 0.0), nullRay) :: Exp (Float, Ray)
 
                                     (newReflectionFactor, reflectionRay) = unlift (
                                             (d <* constant maxdepth) ? (
                                                     --reflection
-                                                    (reflectionFactor ==* 0.0) ? (  
+                                                    (refl ==* 0.0) ? (  
                                                          nullFloatRay,
                                                          --calculate next ray direction and color factor for next trace 
                                                          reflectionFactorAndRay ray 
@@ -542,7 +530,7 @@ mainNormal = do
           G.mainLoop
 
 main :: IO ()
-main = mainDbg
+main = mainNormal
 
 reshape :: Size -> IO ()
 reshape size@(Size w h) = do
